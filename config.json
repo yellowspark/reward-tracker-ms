@@ -1,0 +1,86 @@
+{
+  "enabled": true,
+  "check_interval_seconds": 90,
+  "user_points": 29000,
+  "session": {
+    "cookie": "",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+    "region": "IN"
+  },
+  "targets": [
+    {
+      "id": "flipkart",
+      "name": "Flipkart Gift Card",
+      "enabled": true,
+      "keywords": [
+        "flipkart"
+      ],
+      "url": "https://rewards.bing.com/redeem/",
+      "last_status": "RESTOCKING",
+      "last_checked": null
+    },
+    {
+      "id": "amazon",
+      "name": "Amazon Pay Gift Card",
+      "enabled": true,
+      "keywords": [
+        "amazon",
+        "amazon pay"
+      ],
+      "url": "https://rewards.bing.com/redeem/",
+      "last_status": "OUT_OF_STOCK",
+      "last_checked": null
+    },
+    {
+      "id": "croma",
+      "name": "Croma Gift Card",
+      "enabled": true,
+      "keywords": [
+        "croma"
+      ],
+      "url": "https://rewards.bing.com/redeem/",
+      "last_status": "OUT_OF_STOCK",
+      "last_checked": null
+    },
+    {
+      "id": "other_shopping",
+      "name": "Other Shopping Vouchers (Myntra / Swiggy / Zomato / BMS)",
+      "enabled": true,
+      "keywords": [
+        "myntra",
+        "swiggy",
+        "zomato",
+        "lifestyle",
+        "shoppers stop",
+        "reliance",
+        "bookmyshow"
+      ],
+      "url": "https://rewards.bing.com/redeem/",
+      "last_status": "OUT_OF_STOCK",
+      "last_checked": null
+    }
+  ],
+  "telegram": {
+    "enabled": true,
+    "bot_token": "",
+    "chat_id": ""
+  },
+  "green_api": {
+    "enabled": false,
+    "id_instance": "710722741335",
+    "api_token_instance": "",
+    "host_url": "https://7107.api.greenapi.com",
+    "phone": ""
+  },
+  "whatsapp": {
+    "enabled": false,
+    "callmebot_api_key": "",
+    "phone": ""
+  },
+  "alerts": {
+    "telegram_message": true,
+    "whatsapp_message": true,
+    "whatsapp_call": false,
+    "auto_disable_after_alert": false
+  }
+}

@@ -1,0 +1,46 @@
+name: Microsoft Rewards 24/7 Restock Tracker
+
+on:
+  schedule:
+    # Runs every 5 minutes automatically 24/7 (even when your laptop is turned off!)
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Allows clicking "Run workflow" manually anytime from GitHub website or mobile app
+
+permissions:
+  contents: write
+  actions: write # Needed to auto-pause workflow when stock alert fires
+
+jobs:
+  check-rewards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Cloud Restock Check
+        env:
+          MS_COOKIE: ${{ secrets.MS_COOKIE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GREEN_API_INSTANCE_ID: ${{ secrets.GREEN_API_INSTANCE_ID }}
+          GREEN_API_TOKEN_INSTANCE: ${{ secrets.GREEN_API_TOKEN_INSTANCE }}
+          GREEN_API_HOST: ${{ secrets.GREEN_API_HOST }}
+          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
+          AUTO_PAUSE_ON_ALERT: "true"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python cloud_tracker.py
