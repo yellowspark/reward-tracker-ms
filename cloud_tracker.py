@@ -148,7 +148,6 @@ def check_flipkart_stock(cookie: str) -> tuple[str, str]:
         content = fetch_url(sku_url, cookie)
         lower_content = content.lower()
         
-        # Look for restock notices
         restocking_phrases = [
             "so popular we're restocking",
             "so popular we are restocking",
@@ -172,46 +171,99 @@ def check_flipkart_stock(cookie: str) -> tuple[str, str]:
         return "ERROR", sku_url
 
 
-def check_catalog_targets(catalog_html: str, target: dict, cookie: str) -> tuple[str, str]:
-    """Checks catalog HTML for presence and tests SKU link if present."""
-    name = target["name"]
-    keywords = target["keywords"]
-    sku_url = target.get("sku_url")
-    lower_html = catalog_html.lower()
+def check_specific_sku(name: str, sku_url: str, cookie: str) -> tuple[str, str]:
+    """Checks an exact SKU page (Amazon, Croma, etc.) for active in-stock state."""
+    try:
+        content = fetch_url(sku_url, cookie)
+        lower_content = content.lower()
 
-    # Check presence in catalog
-    found = any(kw.lower() in lower_html for kw in keywords)
-    if not found:
-        return "NOT_IN_CATALOG", "https://rewards.bing.com/redeem/in"
+        # If page redirected or fallback triggered to "recommended items"
+        if "recommended items" in lower_content[:600] or "notfound" in lower_content:
+            return "OUT_OF_STOCK", sku_url
 
-    # For Flipkart, check the dedicated SKU endpoint
-    if "flipkart" in keywords:
-        return check_flipkart_stock(cookie)
+        if any(p in lower_content for p in ["so popular", "restocking", "out of stock"]):
+            return "RESTOCKING", sku_url
 
-    # For other brands like Amazon / Croma, check if catalog link has notfound fallback
-    for kw in keywords:
-        m = re.search(rf'href="(/redeem/sku/[^"]+)"[^>]*>.*?{re.escape(kw)}', catalog_html, re.DOTALL | re.IGNORECASE)
-        if not m:
-            m = re.search(rf'{re.escape(kw)}.*?href="(/redeem/sku/[^"]+)"', catalog_html, re.DOTALL | re.IGNORECASE)
+        if "redeem now" in lower_content or ("redeem" in lower_content and '"isdisabled":false' in lower_content):
+            return "IN_STOCK", sku_url
+
+        return "OUT_OF_STOCK", sku_url
+    except Exception as e:
+        logger.error(f"Error checking {name} SKU ({sku_url}): {e}")
+        return "ERROR", sku_url
+
+
+def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[tuple[str, str]]:
+    """
+    Scans the entire Indian catalog for Flipkart, Amazon Pay, Croma,
+    AND any other retail/shopping chains (Myntra, Swiggy, Zomato, Reliance, Tata, etc.)
+    """
+    in_stock_found = []
+
+    # 1. First, check Flipkart with direct SKU check
+    fk_status, fk_url = check_flipkart_stock(cookie)
+    logger.info(f"Target: Flipkart Gift Card -> Status: {fk_status}")
+    if fk_status == "IN_STOCK":
+        in_stock_found.append(("Flipkart Gift Card", fk_url))
+
+    # 2. Check known VIP SKUs: Amazon Pay & Croma
+    vip_skus = [
+        ("Amazon Pay Gift Card (SKU 25)", "https://rewards.bing.com/redeem/sku/000885000025"),
+        ("Amazon Pay Gift Card (SKU 00)", "https://rewards.bing.com/redeem/sku/000885000000"),
+        ("Croma Gift Card (₹500)", "https://rewards.bing.com/redeem/sku/000885000017"),
+    ]
+
+    for name, sku_url in vip_skus:
+        # Check if fallback parameter is removed from catalog HTML for this SKU
+        sku_id = sku_url.split("/")[-1]
+        pattern = rf'href="(/redeem/sku/{sku_id}[^"]*)"'
+        m = re.search(pattern, catalog_html)
         if m:
             raw_href = m.group(1)
-            full_url = "https://rewards.bing.com" + raw_href
-            # If it redirects to notfound, it's currently unstocked in backend
-            if "notfound=1" in raw_href.lower():
-                return "OUT_OF_STOCK", full_url
-            
-            # Check SKU page directly
-            try:
-                sku_content = fetch_url(full_url, cookie)
-                if any(p in sku_content.lower() for p in ["so popular", "restocking", "out of stock"]):
-                    return "RESTOCKING", full_url
-                if "redeem" in sku_content.lower() and "recommended items" not in sku_content.lower()[:500]:
-                    return "IN_STOCK", full_url
-            except Exception:
-                pass
-            return "RESTOCKING", full_url
+            # If "notfound" fallback is gone, check SKU live!
+            if "notfound" not in raw_href.lower():
+                status, full_url = check_specific_sku(name, sku_url, cookie)
+                logger.info(f"Target: {name} (Live check) -> Status: {status}")
+                if status == "IN_STOCK":
+                    in_stock_found.append((name, full_url))
+            else:
+                logger.info(f"Target: {name} -> Status: OUT_OF_STOCK (Fallback active)")
+        else:
+            logger.info(f"Target: {name} -> Status: NOT_IN_CATALOG")
 
-    return "RESTOCKING", sku_url or "https://rewards.bing.com/redeem/in"
+    # 3. Dynamic Discovery: Scan for ALL other retail/shopping gift cards
+    # Keywords covering popular retail chains in India
+    retail_keywords = [
+        "amazon", "croma", "myntra", "swiggy", "zomato", "bookmyshow",
+        "lifestyle", "shoppers stop", "reliance", "uber", "ola",
+        "bigbasket", "blinkit", "zepto", "dominos", "pizza hut",
+        "pantaloons", "westside", "tatacliq", "tata cliq", "bata",
+        "apollo", "nykaa", "ajio", "decathlon", "kfc", "starbucks"
+    ]
+
+    # Non-shopping items to ignore (sweepstakes, games, charity)
+    ignored_keywords = ["sweepstake", "overwatch", "spotify", "roblox", "league of legends", "donate", "charity", "entry", "entries"]
+
+    # Extract all cards currently listed in catalog
+    all_cards = re.findall(r'href="(/redeem/sku/[^"]+)"[^>]*>.*?alt="([^"]+)"', catalog_html, re.DOTALL)
+    for href, title in all_cards:
+        title_lower = title.lower()
+
+        # Skip ignored non-shopping items or flipkart (already handled)
+        if any(ik in title_lower for ik in ignored_keywords) or "flipkart" in title_lower:
+            continue
+
+        # Check if it matches any shopping / retail chain
+        is_retail = any(rk in title_lower for rk in retail_keywords)
+        if is_retail:
+            if "notfound" not in href.lower():
+                full_sku_url = "https://rewards.bing.com" + href.split("?")[0]
+                status, direct_url = check_specific_sku(title, full_sku_url, cookie)
+                logger.info(f"Target: {title} (Retail match) -> Status: {status}")
+                if status == "IN_STOCK" and (title, direct_url) not in in_stock_found:
+                    in_stock_found.append((title, direct_url))
+
+    return in_stock_found
 
 
 def auto_disable_github_workflow():
@@ -241,7 +293,7 @@ def auto_disable_github_workflow():
 
 
 def main():
-    logger.info("Starting 24/7 Cloud Restock Check for Microsoft Rewards...")
+    logger.info("Starting 24/7 Cloud Restock Check for Microsoft Rewards (India)...")
 
     cookie = get_val("MS_COOKIE")
     if not cookie:
@@ -265,22 +317,7 @@ def main():
             send_telegram(tg_token, tg_chat, "⚠️ *Microsoft Rewards Cloud Tracker*\n\nYour session cookie has expired. Please update it in GitHub Secrets.")
         sys.exit(1)
 
-    targets = [
-        {"name": "Flipkart Gift Card (₹1,000)", "keywords": ["flipkart"], "sku_url": "https://rewards.bing.com/redeem/sku/000885000034"},
-        {"name": "Amazon Pay Gift Card", "keywords": ["amazon", "amazon pay"], "sku_url": "https://rewards.bing.com/redeem/sku/000885000025"},
-        {"name": "Croma Gift Card (₹500)", "keywords": ["croma"], "sku_url": "https://rewards.bing.com/redeem/sku/000885000017"},
-        {"name": "Shopping Vouchers (Myntra/Swiggy)", "keywords": ["myntra", "swiggy", "zomato", "bookmyshow", "lifestyle"], "sku_url": None}
-    ]
-
-    in_stock_vouchers = []
-
-    for t in targets:
-        name = t["name"]
-        status, direct_url = check_catalog_targets(catalog_html, t, cookie)
-        logger.info(f"Target: {name} -> Status: {status} ({direct_url})")
-
-        if status == "IN_STOCK":
-            in_stock_vouchers.append((name, direct_url))
+    in_stock_vouchers = scan_all_retail_cards(catalog_html, cookie)
 
     if in_stock_vouchers:
         names_str = ", ".join([v[0] for v in in_stock_vouchers])
@@ -314,7 +351,7 @@ def main():
             auto_disable_github_workflow()
 
     else:
-        logger.info("Checked all target vouchers. Status confirmed (Flipkart: Restocking, others: not stocked).")
+        logger.info("Checked all retail vouchers. None are currently in stock. Check complete.")
 
 
 if __name__ == "__main__":
