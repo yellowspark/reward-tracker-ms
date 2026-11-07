@@ -118,19 +118,20 @@ def send_callmebot(phone: str, api_key: str, message: str) -> bool:
         return False
 
 
-def fetch_catalog(cookie: str) -> str:
-    url = "https://rewards.bing.com/redeem/"
+def get_headers(cookie: str) -> dict:
     clean_cookie = cookie.strip()
     if clean_cookie.lower().startswith("cookie:"):
         clean_cookie = clean_cookie[7:].strip()
-
-    headers = {
+    return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
         "Cookie": clean_cookie
     }
 
+
+def fetch_url(url: str, cookie: str) -> str:
+    headers = get_headers(cookie)
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=20) as resp:
         final_url = resp.geturl()
@@ -140,35 +141,77 @@ def fetch_catalog(cookie: str) -> str:
         return body
 
 
-def check_stock_status(html: str, target_name: str, keywords: list) -> str:
-    lower_html = html.lower()
+def check_flipkart_stock(cookie: str) -> tuple[str, str]:
+    """Specifically checks the Flipkart SKU page to see if restocking banner has disappeared."""
+    sku_url = "https://rewards.bing.com/redeem/sku/000885000034"
+    try:
+        content = fetch_url(sku_url, cookie)
+        lower_content = content.lower()
+        
+        # Look for restock notices
+        restocking_phrases = [
+            "so popular we're restocking",
+            "so popular we are restocking",
+            "so popular we&#x27;re restocking",
+            "restocking back soon",
+            "restocking soon",
+            "temporarily out of stock"
+        ]
+        
+        is_restocking = any(phrase in lower_content for phrase in restocking_phrases)
+        is_disabled = '"isdisabled":true' in lower_content
+        has_redeem = "redeem now" in lower_content or "redeem" in lower_content
+        
+        if is_restocking or is_disabled:
+            return "RESTOCKING", sku_url
+        elif has_redeem and not is_restocking:
+            return "IN_STOCK", sku_url
+        return "RESTOCKING", sku_url
+    except Exception as e:
+        logger.error(f"Error checking Flipkart SKU page: {e}")
+        return "ERROR", sku_url
 
-    # Check if brand is present
+
+def check_catalog_targets(catalog_html: str, target: dict, cookie: str) -> tuple[str, str]:
+    """Checks catalog HTML for presence and tests SKU link if present."""
+    name = target["name"]
+    keywords = target["keywords"]
+    sku_url = target.get("sku_url")
+    lower_html = catalog_html.lower()
+
+    # Check presence in catalog
     found = any(kw.lower() in lower_html for kw in keywords)
     if not found:
-        return "NOT_IN_CATALOG"
+        return "NOT_IN_CATALOG", "https://rewards.bing.com/redeem/in"
 
-    # Restocking indicators
-    restocking_phrases = [
-        "so popular we're restocking",
-        "so popular we are restocking",
-        "restocking back soon",
-        "restocking soon",
-        "restocking",
-        "out of stock",
-        "temporarily out of stock",
-        "currently unavailable",
-        "not available"
-    ]
+    # For Flipkart, check the dedicated SKU endpoint
+    if "flipkart" in keywords:
+        return check_flipkart_stock(cookie)
 
-    # Find context blocks
+    # For other brands like Amazon / Croma, check if catalog link has notfound fallback
     for kw in keywords:
-        for m in re.finditer(re.escape(kw.lower()), lower_html):
-            chunk = lower_html[max(0, m.start() - 250):min(len(lower_html), m.end() + 500)]
-            if any(phrase in chunk for phrase in restocking_phrases):
-                return "RESTOCKING"
+        m = re.search(rf'href="(/redeem/sku/[^"]+)"[^>]*>.*?{re.escape(kw)}', catalog_html, re.DOTALL | re.IGNORECASE)
+        if not m:
+            m = re.search(rf'{re.escape(kw)}.*?href="(/redeem/sku/[^"]+)"', catalog_html, re.DOTALL | re.IGNORECASE)
+        if m:
+            raw_href = m.group(1)
+            full_url = "https://rewards.bing.com" + raw_href
+            # If it redirects to notfound, it's currently unstocked in backend
+            if "notfound=1" in raw_href.lower():
+                return "OUT_OF_STOCK", full_url
+            
+            # Check SKU page directly
+            try:
+                sku_content = fetch_url(full_url, cookie)
+                if any(p in sku_content.lower() for p in ["so popular", "restocking", "out of stock"]):
+                    return "RESTOCKING", full_url
+                if "redeem" in sku_content.lower() and "recommended items" not in sku_content.lower()[:500]:
+                    return "IN_STOCK", full_url
+            except Exception:
+                pass
+            return "RESTOCKING", full_url
 
-    return "IN_STOCK"
+    return "RESTOCKING", sku_url or "https://rewards.bing.com/redeem/in"
 
 
 def auto_disable_github_workflow():
@@ -214,50 +257,48 @@ def main():
     callme_key = get_val("CALLMEBOT_API_KEY")
 
     try:
-        html = fetch_catalog(cookie)
+        catalog_html = fetch_url("https://rewards.bing.com/redeem/in", cookie)
         logger.info("Catalog HTML retrieved successfully. Scanning target vouchers...")
     except Exception as e:
         logger.error(f"Error fetching Microsoft Rewards page: {e}")
-        # Notify user on telegram if session cookie expired
         if "session cookie expired" in str(e).lower() and tg_token and tg_chat:
             send_telegram(tg_token, tg_chat, "⚠️ *Microsoft Rewards Cloud Tracker*\n\nYour session cookie has expired. Please update it in GitHub Secrets.")
         sys.exit(1)
 
     targets = [
-        {"name": "Flipkart Gift Card", "keywords": ["flipkart"]},
-        {"name": "Amazon Pay Gift Card", "keywords": ["amazon", "amazon pay"]},
-        {"name": "Croma Gift Card", "keywords": ["croma"]},
-        {"name": "Shopping Vouchers", "keywords": ["myntra", "swiggy", "zomato", "bookmyshow", "lifestyle"]}
+        {"name": "Flipkart Gift Card (₹1,000)", "keywords": ["flipkart"], "sku_url": "https://rewards.bing.com/redeem/sku/000885000034"},
+        {"name": "Amazon Pay Gift Card", "keywords": ["amazon", "amazon pay"], "sku_url": "https://rewards.bing.com/redeem/sku/000885000025"},
+        {"name": "Croma Gift Card (₹500)", "keywords": ["croma"], "sku_url": "https://rewards.bing.com/redeem/sku/000885000017"},
+        {"name": "Shopping Vouchers (Myntra/Swiggy)", "keywords": ["myntra", "swiggy", "zomato", "bookmyshow", "lifestyle"], "sku_url": None}
     ]
 
     in_stock_vouchers = []
 
     for t in targets:
         name = t["name"]
-        keywords = t["keywords"]
-        status = check_stock_status(html, name, keywords)
-        logger.info(f"Target: {name} -> Status: {status}")
+        status, direct_url = check_catalog_targets(catalog_html, t, cookie)
+        logger.info(f"Target: {name} -> Status: {status} ({direct_url})")
 
         if status == "IN_STOCK":
-            in_stock_vouchers.append(name)
+            in_stock_vouchers.append((name, direct_url))
 
     if in_stock_vouchers:
-        vouchers_str = ", ".join(in_stock_vouchers)
-        logger.info(f"🎉 RESTOCK DETECTED! Vouchers in stock: {vouchers_str}")
+        names_str = ", ".join([v[0] for v in in_stock_vouchers])
+        first_url = in_stock_vouchers[0][1]
+        logger.info(f"🎉 RESTOCK DETECTED! Vouchers in stock: {names_str}")
 
         msg = (
             f"🚨 *MICROSOFT REWARDS RESTOCK ALERT!* 🚨\n\n"
-            f"🎁 *Available Now:* {vouchers_str}\n"
-            f"💰 *Your Points:* ~29,000 pts ready to redeem!\n"
+            f"🎁 *Available Now:* {names_str}\n"
             f"⚡ *Status:* **IN STOCK / READY TO REDEEM!**\n\n"
             f"👉 *CLAIM NOW BEFORE IT SELLS OUT:*\n"
-            f"https://rewards.bing.com/redeem/\n\n"
-            f"⏰ _Stock for popular vouchers is extremely limited. Claim immediately!_"
+            f"{first_url}\n\n"
+            f"⏰ _Stock is extremely limited. Claim immediately!_"
         )
 
         # 1. Telegram
         if tg_token and tg_chat:
-            send_telegram(tg_token, tg_chat, msg, direct_url="https://rewards.bing.com/redeem/")
+            send_telegram(tg_token, tg_chat, msg, direct_url=first_url)
 
         # 2. Green-API WhatsApp
         sent_wa = False
@@ -273,7 +314,7 @@ def main():
             auto_disable_github_workflow()
 
     else:
-        logger.info("Checked all target vouchers. None are currently in stock. Check complete.")
+        logger.info("Checked all target vouchers. Status confirmed (Flipkart: Restocking, others: not stocked).")
 
 
 if __name__ == "__main__":
