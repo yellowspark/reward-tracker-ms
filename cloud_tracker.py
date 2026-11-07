@@ -177,7 +177,6 @@ def check_specific_sku(name: str, sku_url: str, cookie: str) -> tuple[str, str]:
         content = fetch_url(sku_url, cookie)
         lower_content = content.lower()
 
-        # If page redirected or fallback triggered to "recommended items"
         if "recommended items" in lower_content[:600] or "notfound" in lower_content:
             return "OUT_OF_STOCK", sku_url
 
@@ -214,13 +213,11 @@ def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[tuple[str, str
     ]
 
     for name, sku_url in vip_skus:
-        # Check if fallback parameter is removed from catalog HTML for this SKU
         sku_id = sku_url.split("/")[-1]
         pattern = rf'href="(/redeem/sku/{sku_id}[^"]*)"'
         m = re.search(pattern, catalog_html)
         if m:
             raw_href = m.group(1)
-            # If "notfound" fallback is gone, check SKU live!
             if "notfound" not in raw_href.lower():
                 status, full_url = check_specific_sku(name, sku_url, cookie)
                 logger.info(f"Target: {name} (Live check) -> Status: {status}")
@@ -232,7 +229,6 @@ def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[tuple[str, str
             logger.info(f"Target: {name} -> Status: NOT_IN_CATALOG")
 
     # 3. Dynamic Discovery: Scan for ALL other retail/shopping gift cards
-    # Keywords covering popular retail chains in India
     retail_keywords = [
         "amazon", "croma", "myntra", "swiggy", "zomato", "bookmyshow",
         "lifestyle", "shoppers stop", "reliance", "uber", "ola",
@@ -241,19 +237,15 @@ def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[tuple[str, str
         "apollo", "nykaa", "ajio", "decathlon", "kfc", "starbucks"
     ]
 
-    # Non-shopping items to ignore (sweepstakes, games, charity)
     ignored_keywords = ["sweepstake", "overwatch", "spotify", "roblox", "league of legends", "donate", "charity", "entry", "entries"]
 
-    # Extract all cards currently listed in catalog
     all_cards = re.findall(r'href="(/redeem/sku/[^"]+)"[^>]*>.*?alt="([^"]+)"', catalog_html, re.DOTALL)
     for href, title in all_cards:
         title_lower = title.lower()
 
-        # Skip ignored non-shopping items or flipkart (already handled)
         if any(ik in title_lower for ik in ignored_keywords) or "flipkart" in title_lower:
             continue
 
-        # Check if it matches any shopping / retail chain
         is_retail = any(rk in title_lower for rk in retail_keywords)
         if is_retail:
             if "notfound" not in href.lower():
@@ -287,7 +279,7 @@ def auto_disable_github_workflow():
             method="PUT"
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            logger.info("Successfully paused GitHub Actions workflow following restock alert!")
+            logger.info("Successfully auto-paused GitHub Actions workflow following restock alert!")
     except Exception as e:
         logger.debug(f"Workflow auto-pause notice: {e}")
 
@@ -324,13 +316,17 @@ def main():
         first_url = in_stock_vouchers[0][1]
         logger.info(f"🎉 RESTOCK DETECTED! Vouchers in stock: {names_str}")
 
+        repo = os.environ.get("GITHUB_REPOSITORY", "yellowspark/reward-tracker-ms")
+        re_enable_url = f"https://github.com/{repo}/actions"
+
         msg = (
             f"🚨 *MICROSOFT REWARDS RESTOCK ALERT!* 🚨\n\n"
             f"🎁 *Available Now:* {names_str}\n"
             f"⚡ *Status:* **IN STOCK / READY TO REDEEM!**\n\n"
             f"👉 *CLAIM NOW BEFORE IT SELLS OUT:*\n"
             f"{first_url}\n\n"
-            f"⏰ _Stock is extremely limited. Claim immediately!_"
+            f"🛑 _The tracker has auto-paused so you aren't spammed with repeated alerts while redeeming. Once you finish, you can re-enable anytime here:_\n"
+            f"{re_enable_url}"
         )
 
         # 1. Telegram
