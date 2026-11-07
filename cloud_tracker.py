@@ -141,13 +141,51 @@ def fetch_url(url: str, cookie: str) -> str:
         return body
 
 
-def check_flipkart_stock(cookie: str) -> tuple[str, str]:
+def extract_user_points(html: str, cookie: str) -> int:
+    """Extracts live user points balance directly from Microsoft Rewards HTML or Cookie."""
+    # 1. From page JSON payload: {"balance":31074,"level":3}
+    m = re.search(r'\"balance\":\s*(\d+)', html)
+    if m:
+        return int(m.group(1))
+
+    # 2. From Cookie: rb=31074
+    m_cookie = re.search(r'\brb=(\d+)', cookie)
+    if m_cookie:
+        return int(m_cookie.group(1))
+
+    return 0
+
+
+def extract_card_points_cost(card_html: str, sku_html: str = "") -> int:
+    """Extracts the point cost required to redeem this specific card."""
+    for src in [card_html, sku_html]:
+        if not src:
+            continue
+        m = re.search(r'text-itemHeader\">([\d,]+)<', src)
+        if m:
+            return int(m.group(1).replace(",", ""))
+        m_pts = re.search(r'\"price\":\s*(\d+)', src)
+        if m_pts:
+            return int(m_pts.group(1))
+        m_general = re.search(r'([\d,]+)\s*(?:pts|points)', src, re.I)
+        if m_general:
+            val = int(m_general.group(1).replace(",", ""))
+            if val >= 500:
+                return val
+    return 0
+
+
+def check_flipkart_stock(cookie: str) -> tuple[str, str, int]:
     """Specifically checks the Flipkart SKU page to see if restocking banner has disappeared."""
     sku_url = "https://rewards.bing.com/redeem/sku/000885000034"
+    cost = 19320  # Default ₹1,000 Flipkart cost
     try:
         content = fetch_url(sku_url, cookie)
         lower_content = content.lower()
-        
+        extracted_cost = extract_card_points_cost("", content)
+        if extracted_cost > 0:
+            cost = extracted_cost
+
         restocking_phrases = [
             "so popular we're restocking",
             "so popular we are restocking",
@@ -156,75 +194,88 @@ def check_flipkart_stock(cookie: str) -> tuple[str, str]:
             "restocking soon",
             "temporarily out of stock"
         ]
-        
+
         is_restocking = any(phrase in lower_content for phrase in restocking_phrases)
         is_disabled = '"isdisabled":true' in lower_content
         has_redeem = "redeem now" in lower_content or "redeem" in lower_content
-        
+
         if is_restocking or is_disabled:
-            return "RESTOCKING", sku_url
+            return "RESTOCKING", sku_url, cost
         elif has_redeem and not is_restocking:
-            return "IN_STOCK", sku_url
-        return "RESTOCKING", sku_url
+            return "IN_STOCK", sku_url, cost
+        return "RESTOCKING", sku_url, cost
     except Exception as e:
         logger.error(f"Error checking Flipkart SKU page: {e}")
-        return "ERROR", sku_url
+        return "ERROR", sku_url, cost
 
 
-def check_specific_sku(name: str, sku_url: str, cookie: str) -> tuple[str, str]:
+def check_specific_sku(name: str, sku_url: str, default_cost: int, cookie: str) -> tuple[str, str, int]:
     """Checks an exact SKU page (Amazon, Croma, etc.) for active in-stock state."""
+    cost = default_cost
     try:
         content = fetch_url(sku_url, cookie)
         lower_content = content.lower()
+        extracted_cost = extract_card_points_cost("", content)
+        if extracted_cost > 0:
+            cost = extracted_cost
 
         if "recommended items" in lower_content[:600] or "notfound" in lower_content:
-            return "OUT_OF_STOCK", sku_url
+            return "OUT_OF_STOCK", sku_url, cost
 
         if any(p in lower_content for p in ["so popular", "restocking", "out of stock"]):
-            return "RESTOCKING", sku_url
+            return "RESTOCKING", sku_url, cost
 
         if "redeem now" in lower_content or ("redeem" in lower_content and '"isdisabled":false' in lower_content):
-            return "IN_STOCK", sku_url
+            return "IN_STOCK", sku_url, cost
 
-        return "OUT_OF_STOCK", sku_url
+        return "OUT_OF_STOCK", sku_url, cost
     except Exception as e:
         logger.error(f"Error checking {name} SKU ({sku_url}): {e}")
-        return "ERROR", sku_url
+        return "ERROR", sku_url, cost
 
 
-def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[tuple[str, str]]:
+def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[dict]:
     """
     Scans the entire Indian catalog for Flipkart, Amazon Pay, Croma,
     AND any other retail/shopping chains (Myntra, Swiggy, Zomato, Reliance, Tata, etc.)
+    Returns list of dicts: {"name": ..., "url": ..., "cost": ..., "status": ...}
     """
     in_stock_found = []
 
     # 1. First, check Flipkart with direct SKU check
-    fk_status, fk_url = check_flipkart_stock(cookie)
-    logger.info(f"Target: Flipkart Gift Card -> Status: {fk_status}")
+    fk_status, fk_url, fk_cost = check_flipkart_stock(cookie)
+    logger.info(f"Target: Flipkart Gift Card -> Status: {fk_status} (Cost: {fk_cost:,} pts)")
     if fk_status == "IN_STOCK":
-        in_stock_found.append(("Flipkart Gift Card", fk_url))
+        in_stock_found.append({"name": "Flipkart Gift Card (₹1,000)", "url": fk_url, "cost": fk_cost})
 
     # 2. Check known VIP SKUs: Amazon Pay & Croma
     vip_skus = [
-        ("Amazon Pay Gift Card (SKU 25)", "https://rewards.bing.com/redeem/sku/000885000025"),
-        ("Amazon Pay Gift Card (SKU 00)", "https://rewards.bing.com/redeem/sku/000885000000"),
-        ("Croma Gift Card (₹500)", "https://rewards.bing.com/redeem/sku/000885000017"),
+        ("Amazon Pay Gift Card (₹500)", "https://rewards.bing.com/redeem/sku/000885000025", 8150),
+        ("Amazon Pay Gift Card (₹250)", "https://rewards.bing.com/redeem/sku/000885000000", 4000),
+        ("Croma Gift Card (₹500)", "https://rewards.bing.com/redeem/sku/000885000017", 7475),
     ]
 
-    for name, sku_url in vip_skus:
+    for name, sku_url, default_cost in vip_skus:
         sku_id = sku_url.split("/")[-1]
         pattern = rf'href="(/redeem/sku/{sku_id}[^"]*)"'
         m = re.search(pattern, catalog_html)
         if m:
             raw_href = m.group(1)
+            # Find cost in catalog HTML if available
+            card_block_m = re.search(rf'<a[^>]*href="{re.escape(raw_href)}"[^>]*>.*?</a>', catalog_html, re.DOTALL)
+            cost = default_cost
+            if card_block_m:
+                c_cost = extract_card_points_cost(card_block_m.group(0))
+                if c_cost > 0:
+                    cost = c_cost
+
             if "notfound" not in raw_href.lower():
-                status, full_url = check_specific_sku(name, sku_url, cookie)
-                logger.info(f"Target: {name} (Live check) -> Status: {status}")
+                status, full_url, final_cost = check_specific_sku(name, sku_url, cost, cookie)
+                logger.info(f"Target: {name} (Live check) -> Status: {status} (Cost: {final_cost:,} pts)")
                 if status == "IN_STOCK":
-                    in_stock_found.append((name, full_url))
+                    in_stock_found.append({"name": name, "url": full_url, "cost": final_cost})
             else:
-                logger.info(f"Target: {name} -> Status: OUT_OF_STOCK (Fallback active)")
+                logger.info(f"Target: {name} -> Status: OUT_OF_STOCK (Fallback active) (Cost: {cost:,} pts)")
         else:
             logger.info(f"Target: {name} -> Status: NOT_IN_CATALOG")
 
@@ -239,27 +290,65 @@ def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[tuple[str, str
 
     ignored_keywords = ["sweepstake", "overwatch", "spotify", "roblox", "league of legends", "donate", "charity", "entry", "entries"]
 
-    all_cards = re.findall(r'href="(/redeem/sku/[^"]+)"[^>]*>.*?alt="([^"]+)"', catalog_html, re.DOTALL)
-    for href, title in all_cards:
+    card_blocks = re.findall(r'(<a[^>]*href=\"/redeem/sku/[^\"]+\"[^>]*>.*?</a>)', catalog_html, re.DOTALL)
+    for block in card_blocks:
+        name_m = re.search(r'alt=\"([^\"]+)\"', block)
+        href_m = re.search(r'href=\"([^\"]+)\"', block)
+        if not name_m or not href_m:
+            continue
+
+        title = name_m.group(1)
+        href = href_m.group(1)
         title_lower = title.lower()
 
         if any(ik in title_lower for ik in ignored_keywords) or "flipkart" in title_lower:
             continue
 
         is_retail = any(rk in title_lower for rk in retail_keywords)
-        if is_retail:
-            if "notfound" not in href.lower():
-                full_sku_url = "https://rewards.bing.com" + href.split("?")[0]
-                status, direct_url = check_specific_sku(title, full_sku_url, cookie)
-                logger.info(f"Target: {title} (Retail match) -> Status: {status}")
-                if status == "IN_STOCK" and (title, direct_url) not in in_stock_found:
-                    in_stock_found.append((title, direct_url))
+        if is_retail and "notfound" not in href.lower():
+            full_sku_url = "https://rewards.bing.com" + href.split("?")[0]
+            card_cost = extract_card_points_cost(block)
+            status, direct_url, final_cost = check_specific_sku(title, full_sku_url, card_cost, cookie)
+            logger.info(f"Target: {title} (Retail match) -> Status: {status} (Cost: {final_cost:,} pts)")
+            if status == "IN_STOCK":
+                if not any(item["url"] == direct_url for item in in_stock_found):
+                    in_stock_found.append({"name": title, "url": direct_url, "cost": final_cost})
 
     return in_stock_found
 
 
+def calculate_redemption_plans(available_items: list[dict], user_points: int) -> list[str]:
+    """Generates intelligent combination suggestions based on available balance."""
+    suggestions = []
+    if not available_items or user_points <= 0:
+        return suggestions
+
+    # Single card maximums
+    for item in available_items:
+        cost = item["cost"]
+        if cost > 0:
+            count = user_points // cost
+            if count > 1:
+                total = count * cost
+                rem = user_points - total
+                suggestions.append(f"• *{count}x {item['name']}* ({total:,} pts total, leaves {rem:,} pts)")
+
+    # 2-card combos if multiple distinct cards in stock
+    if len(available_items) >= 2:
+        for i in range(len(available_items)):
+            for j in range(i + 1, len(available_items)):
+                c1 = available_items[i]
+                c2 = available_items[j]
+                combo_cost = c1["cost"] + c2["cost"]
+                if combo_cost <= user_points and combo_cost > 0:
+                    rem = user_points - combo_cost
+                    suggestions.append(f"• *1x {c1['name']}* + *1x {c2['name']}* ({combo_cost:,} pts total, leaves {rem:,} pts)")
+
+    return suggestions[:4]
+
+
 def auto_disable_github_workflow():
-    """Optionally disables this GitHub workflow once restock alert has fired to avoid duplicate alerts."""
+    """Disables this GitHub workflow once restock alert has fired to avoid duplicate alerts."""
     github_token = os.environ.get("GITHUB_TOKEN")
     github_repo = os.environ.get("GITHUB_REPOSITORY")
     workflow_name = "rewards_tracker.yml"
@@ -309,45 +398,83 @@ def main():
             send_telegram(tg_token, tg_chat, "⚠️ *Microsoft Rewards Cloud Tracker*\n\nYour session cookie has expired. Please update it in GitHub Secrets.")
         sys.exit(1)
 
-    in_stock_vouchers = scan_all_retail_cards(catalog_html, cookie)
+    # 1. Read live points balance
+    user_points = extract_user_points(catalog_html, cookie)
+    logger.info(f"Live User Balance: {user_points:,} reward points")
 
-    if in_stock_vouchers:
-        names_str = ", ".join([v[0] for v in in_stock_vouchers])
-        first_url = in_stock_vouchers[0][1]
-        logger.info(f"🎉 RESTOCK DETECTED! Vouchers in stock: {names_str}")
+    # 2. Scan all target retail cards
+    in_stock_items = scan_all_retail_cards(catalog_html, cookie)
 
-        repo = os.environ.get("GITHUB_REPOSITORY", "yellowspark/reward-tracker-ms")
-        re_enable_url = f"https://github.com/{repo}/actions"
+    if not in_stock_items:
+        logger.info(f"Checked all retail vouchers. None are currently in stock. Live points: {user_points:,}. Check complete.")
+        return
 
-        msg = (
-            f"🚨 *MICROSOFT REWARDS RESTOCK ALERT!* 🚨\n\n"
-            f"🎁 *Available Now:* {names_str}\n"
-            f"⚡ *Status:* **IN STOCK / READY TO REDEEM!**\n\n"
-            f"👉 *CLAIM NOW BEFORE IT SELLS OUT:*\n"
-            f"{first_url}\n\n"
-            f"🛑 _The tracker has auto-paused so you aren't spammed with repeated alerts while redeeming. Once you finish, you can re-enable anytime here:_\n"
-            f"{re_enable_url}"
-        )
+    # 3. Budget / Affordability Gate:
+    # Filter only cards that the user has sufficient points to redeem!
+    affordable_items = []
+    unaffordable_items = []
 
-        # 1. Telegram
-        if tg_token and tg_chat:
-            send_telegram(tg_token, tg_chat, msg, direct_url=first_url)
+    for item in in_stock_items:
+        cost = item.get("cost", 0)
+        if user_points >= cost or cost == 0:
+            affordable_items.append(item)
+        else:
+            unaffordable_items.append(item)
+            logger.info(f"Item in stock but UNAFFORDABLE: {item['name']} requires {cost:,} pts (User has: {user_points:,} pts). Skipping alert.")
 
-        # 2. Green-API WhatsApp
-        sent_wa = False
-        if green_id and green_token and phone:
-            sent_wa = send_green_api(green_id, green_token, phone, msg, green_host)
+    # If in-stock items exist, but none can be afforded with current points balance, do NOT alert!
+    if not affordable_items:
+        logger.info(f"Cards found in stock, but none are affordable with current balance ({user_points:,} pts). Skipping notification.")
+        return
 
-        # 3. CallMeBot WhatsApp (Fallback)
-        if not sent_wa and phone and callme_key:
-            send_callmebot(phone, callme_key, msg)
+    # 4. Generate notification message with points & combos
+    logger.info(f"🎉 AFFORDABLE RESTOCK DETECTED! Items: {[i['name'] for i in affordable_items]}")
 
-        # Auto-pause GitHub workflow to prevent spamming
-        if os.environ.get("AUTO_PAUSE_ON_ALERT", "false").lower() == "true":
-            auto_disable_github_workflow()
+    items_block = []
+    for item in affordable_items:
+        cost_str = f" ({item['cost']:,} pts)" if item.get("cost") else ""
+        items_block.append(f"• *{item['name']}*{cost_str}\n  👉 {item['url']}")
 
-    else:
-        logger.info("Checked all retail vouchers. None are currently in stock. Check complete.")
+    items_text = "\n".join(items_block)
+
+    # Calculate combination suggestions if multiple affordable
+    combo_suggestions = calculate_redemption_plans(affordable_items, user_points)
+    combo_text = ""
+    if combo_suggestions:
+        combo_text = "\n\n💡 *What you can redeem with your balance:*\n" + "\n".join(combo_suggestions)
+
+    repo = os.environ.get("GITHUB_REPOSITORY", "yellowspark/reward-tracker-ms")
+    re_enable_url = f"https://github.com/{repo}/actions"
+
+    msg = (
+        f"🚨 *MICROSOFT REWARDS RESTOCK ALERT!* 🚨\n\n"
+        f"💰 *Your Live Balance:* *{user_points:,} Points*\n"
+        f"⚡ *In Stock & Redeemable by You:*\n\n"
+        f"{items_text}"
+        f"{combo_text}\n\n"
+        f"⏰ _Stock is extremely limited. Claim immediately!_\n\n"
+        f"🛑 _The tracker auto-paused so you aren't spammed with repeated alerts while redeeming. Re-enable anytime here:_\n"
+        f"{re_enable_url}"
+    )
+
+    first_url = affordable_items[0]["url"]
+
+    # Send Telegram
+    if tg_token and tg_chat:
+        send_telegram(tg_token, tg_chat, msg, direct_url=first_url)
+
+    # Send WhatsApp (Green-API)
+    sent_wa = False
+    if green_id and green_token and phone:
+        sent_wa = send_green_api(green_id, green_token, phone, msg, green_host)
+
+    # Send WhatsApp (CallMeBot fallback)
+    if not sent_wa and phone and callme_key:
+        send_callmebot(phone, callme_key, msg)
+
+    # Auto-pause GitHub workflow
+    if os.environ.get("AUTO_PAUSE_ON_ALERT", "false").lower() == "true":
+        auto_disable_github_workflow()
 
 
 if __name__ == "__main__":
