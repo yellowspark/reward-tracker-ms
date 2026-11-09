@@ -33,6 +33,7 @@ jobs:
       - name: Run Cloud Restock Check
         env:
           MS_COOKIE: ${{ secrets.MS_COOKIE }}
+          USER_POINTS: ${{ secrets.USER_POINTS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GREEN_API_INSTANCE_ID: ${{ secrets.GREEN_API_INSTANCE_ID }}

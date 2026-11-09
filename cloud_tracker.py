@@ -11,6 +11,7 @@ import re
 import sys
 import urllib.parse
 import urllib.request
+import urllib.error
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,6 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger("RewardsCloudTracker")
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+DEFAULT_USER_POINTS = 31000  # Fallback point budget if cookie expires
 
 
 def get_val(env_key: str, default: str = "") -> str:
@@ -40,6 +42,7 @@ def get_val(env_key: str, default: str = "") -> str:
                     "GREEN_API_HOST": cfg.get("green_api", {}).get("host_url", ""),
                     "WHATSAPP_PHONE": cfg.get("green_api", {}).get("phone", "") or cfg.get("whatsapp", {}).get("phone", ""),
                     "CALLMEBOT_API_KEY": cfg.get("whatsapp", {}).get("callmebot_api_key", ""),
+                    "USER_POINTS": str(cfg.get("user_points", DEFAULT_USER_POINTS)),
                 }
                 return mapping.get(env_key, default)
         except Exception:
@@ -48,27 +51,55 @@ def get_val(env_key: str, default: str = "") -> str:
 
 
 def send_telegram(token: str, chat_id: str, message: str, direct_url: str = "") -> bool:
+    """Robust Telegram sender that tries Markdown first, then auto-retries plain text if HTTP 400."""
     if not token or not chat_id:
+        logger.warning("Telegram Bot Token or Chat ID not configured.")
         return False
+
     url = f"https://api.telegram.org/bot{token.strip()}/sendMessage"
-    payload = {
-        "chat_id": chat_id.strip(),
+    clean_chat_id = chat_id.strip()
+
+    base_payload = {
+        "chat_id": clean_chat_id,
         "text": message,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": False
     }
+
     if direct_url and direct_url.startswith("http"):
-        payload["reply_markup"] = {
+        base_payload["reply_markup"] = {
             "inline_keyboard": [
                 [{"text": "⚡ REDEEM GIFT CARD NOW ⚡", "url": direct_url}]
             ]
         }
+
+    # Attempt 1: With Markdown formatting
     try:
-        data = json.dumps(payload).encode("utf-8")
+        md_payload = dict(base_payload)
+        md_payload["parse_mode"] = "Markdown"
+        data = json.dumps(md_payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as resp:
-            logger.info("Telegram notification sent successfully!")
+            logger.info("Telegram notification sent successfully (Markdown mode)!")
             return True
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        logger.warning(f"Telegram Markdown error: {e.code} - {err_body}. Retrying in plain text...")
+
+        # Attempt 2: Fallback without Markdown (prevents HTTP 400 parse errors)
+        try:
+            plain_payload = dict(base_payload)
+            # Remove markdown syntax characters for plain text
+            plain_text = message.replace("*", "").replace("_", "")
+            plain_payload["text"] = plain_text
+            data_plain = json.dumps(plain_payload).encode("utf-8")
+            req_plain = urllib.request.Request(url, data=data_plain, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req_plain, timeout=15) as resp2:
+                logger.info("Telegram notification sent successfully (Plain text fallback)!")
+                return True
+        except urllib.error.HTTPError as e2:
+            err_body2 = e2.read().decode("utf-8", errors="ignore")
+            logger.error(f"Telegram Plain Text fallback failed: {e2.code} - {err_body2}")
+            return False
     except Exception as e:
         logger.error(f"Failed to send Telegram message: {e}")
         return False
@@ -118,42 +149,62 @@ def send_callmebot(phone: str, api_key: str, message: str) -> bool:
         return False
 
 
-def get_headers(cookie: str) -> dict:
-    clean_cookie = cookie.strip()
-    if clean_cookie.lower().startswith("cookie:"):
-        clean_cookie = clean_cookie[7:].strip()
-    return {
+def fetch_url(url: str, cookie: str = "") -> tuple[str, bool]:
+    """
+    Smart fetch: tries with cookie first for live user balance.
+    If the cookie is expired or redirects to login.live.com,
+    it automatically falls back to public catalog mode (200 OK) without cookie.
+    Never crashes or stops monitoring!
+    Returns (html_content, is_authenticated)
+    """
+    headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
-        "Cookie": clean_cookie
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8"
     }
 
+    clean_cookie = cookie.strip() if cookie else ""
+    if clean_cookie.lower().startswith("cookie:"):
+        clean_cookie = clean_cookie[7:].strip()
 
-def fetch_url(url: str, cookie: str) -> str:
-    headers = get_headers(cookie)
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        final_url = resp.geturl()
+    # 1. Try with cookie if provided
+    if clean_cookie:
+        auth_headers = dict(headers)
+        auth_headers["Cookie"] = clean_cookie
+        req = urllib.request.Request(url, headers=auth_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                final_url = resp.geturl()
+                body = resp.read().decode("utf-8", errors="ignore")
+                if "login.live.com" not in final_url and "Sign in to your Microsoft account" not in body:
+                    return body, True
+                else:
+                    logger.warning("Session cookie redirected to login (expired). Auto-switching to public catalog check mode...")
+        except Exception as e:
+            logger.warning(f"Cookie fetch warning: {e}. Auto-switching to public catalog check mode...")
+
+    # 2. Resilient Fallback: Fetch without cookie (public mode)
+    req_pub = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req_pub, timeout=20) as resp:
         body = resp.read().decode("utf-8", errors="ignore")
-        if "login.live.com" in final_url or "Sign in to your Microsoft account" in body:
-            raise ValueError("Microsoft session cookie expired or invalid. Please update cookie.")
-        return body
+        return body, False
 
 
 def extract_user_points(html: str, cookie: str) -> int:
     """Extracts live user points balance directly from Microsoft Rewards HTML or Cookie."""
-    # 1. From page JSON payload: {"balance":31074,"level":3}
     m = re.search(r'\"balance\":\s*(\d+)', html)
     if m:
         return int(m.group(1))
 
-    # 2. From Cookie: rb=31074
     m_cookie = re.search(r'\brb=(\d+)', cookie)
     if m_cookie:
         return int(m_cookie.group(1))
 
-    return 0
+    try:
+        cfg_pts = int(get_val("USER_POINTS", str(DEFAULT_USER_POINTS)))
+        return cfg_pts
+    except Exception:
+        return DEFAULT_USER_POINTS
 
 
 def extract_card_points_cost(card_html: str, sku_html: str = "") -> int:
@@ -180,7 +231,7 @@ def check_flipkart_stock(cookie: str) -> tuple[str, str, int]:
     sku_url = "https://rewards.bing.com/redeem/sku/000885000034"
     cost = 19320  # Default ₹1,000 Flipkart cost
     try:
-        content = fetch_url(sku_url, cookie)
+        content, _ = fetch_url(sku_url, cookie)
         lower_content = content.lower()
         extracted_cost = extract_card_points_cost("", content)
         if extracted_cost > 0:
@@ -213,7 +264,7 @@ def check_specific_sku(name: str, sku_url: str, default_cost: int, cookie: str) 
     """Checks an exact SKU page (Amazon, Croma, etc.) for active in-stock state."""
     cost = default_cost
     try:
-        content = fetch_url(sku_url, cookie)
+        content, _ = fetch_url(sku_url, cookie)
         lower_content = content.lower()
         extracted_cost = extract_card_points_cost("", content)
         if extracted_cost > 0:
@@ -238,7 +289,7 @@ def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[dict]:
     """
     Scans the entire Indian catalog for Flipkart, Amazon Pay, Croma,
     AND any other retail/shopping chains (Myntra, Swiggy, Zomato, Reliance, Tata, etc.)
-    Returns list of dicts: {"name": ..., "url": ..., "cost": ..., "status": ...}
+    Returns list of dicts: {"name": ..., "url": ..., "cost": ...}
     """
     in_stock_found = []
 
@@ -261,7 +312,6 @@ def scan_all_retail_cards(catalog_html: str, cookie: str) -> list[dict]:
         m = re.search(pattern, catalog_html)
         if m:
             raw_href = m.group(1)
-            # Find cost in catalog HTML if available
             card_block_m = re.search(rf'<a[^>]*href="{re.escape(raw_href)}"[^>]*>.*?</a>', catalog_html, re.DOTALL)
             cost = default_cost
             if card_block_m:
@@ -323,7 +373,6 @@ def calculate_redemption_plans(available_items: list[dict], user_points: int) ->
     if not available_items or user_points <= 0:
         return suggestions
 
-    # Single card maximums
     for item in available_items:
         cost = item["cost"]
         if cost > 0:
@@ -333,7 +382,6 @@ def calculate_redemption_plans(available_items: list[dict], user_points: int) ->
                 rem = user_points - total
                 suggestions.append(f"• *{count}x {item['name']}* ({total:,} pts total, leaves {rem:,} pts)")
 
-    # 2-card combos if multiple distinct cards in stock
     if len(available_items) >= 2:
         for i in range(len(available_items)):
             for j in range(i + 1, len(available_items)):
@@ -376,11 +424,7 @@ def auto_disable_github_workflow():
 def main():
     logger.info("Starting 24/7 Cloud Restock Check for Microsoft Rewards (India)...")
 
-    cookie = get_val("MS_COOKIE")
-    if not cookie:
-        logger.error("MS_COOKIE is not provided. Set MS_COOKIE secret or environment variable.")
-        sys.exit(1)
-
+    cookie = get_val("MS_COOKIE", "")
     tg_token = get_val("TELEGRAM_BOT_TOKEN")
     tg_chat = get_val("TELEGRAM_CHAT_ID")
     green_id = get_val("GREEN_API_INSTANCE_ID")
@@ -389,45 +433,41 @@ def main():
     phone = get_val("WHATSAPP_PHONE")
     callme_key = get_val("CALLMEBOT_API_KEY")
 
+    # Resilient Fetch: Tries authenticated mode, auto-falls back to public catalog
     try:
-        catalog_html = fetch_url("https://rewards.bing.com/redeem/in", cookie)
-        logger.info("Catalog HTML retrieved successfully. Scanning target vouchers...")
+        catalog_html, is_authenticated = fetch_url("https://rewards.bing.com/redeem/in", cookie)
+        mode_label = "Authenticated" if is_authenticated else "Public Fallback"
+        logger.info(f"Catalog HTML retrieved successfully ({mode_label} mode). Scanning vouchers...")
     except Exception as e:
-        logger.error(f"Error fetching Microsoft Rewards page: {e}")
-        if "session cookie expired" in str(e).lower() and tg_token and tg_chat:
-            send_telegram(tg_token, tg_chat, "⚠️ *Microsoft Rewards Cloud Tracker*\n\nYour session cookie has expired. Please update it in GitHub Secrets.")
-        sys.exit(1)
+        logger.error(f"Failed to fetch Microsoft Rewards catalog: {e}")
+        # Never crash GitHub Action with sys.exit(1) on transient connection hiccups
+        return
 
     # 1. Read live points balance
     user_points = extract_user_points(catalog_html, cookie)
-    logger.info(f"Live User Balance: {user_points:,} reward points")
+    logger.info(f"User Balance for Affordability: {user_points:,} reward points")
 
     # 2. Scan all target retail cards
     in_stock_items = scan_all_retail_cards(catalog_html, cookie)
 
     if not in_stock_items:
-        logger.info(f"Checked all retail vouchers. None are currently in stock. Live points: {user_points:,}. Check complete.")
+        logger.info(f"Checked all retail vouchers. None are currently in stock. User points: {user_points:,}. Check complete.")
         return
 
     # 3. Budget / Affordability Gate:
-    # Filter only cards that the user has sufficient points to redeem!
     affordable_items = []
-    unaffordable_items = []
-
     for item in in_stock_items:
         cost = item.get("cost", 0)
         if user_points >= cost or cost == 0:
             affordable_items.append(item)
         else:
-            unaffordable_items.append(item)
-            logger.info(f"Item in stock but UNAFFORDABLE: {item['name']} requires {cost:,} pts (User has: {user_points:,} pts). Skipping alert.")
+            logger.info(f"Item in stock but UNAFFORDABLE: {item['name']} requires {cost:,} pts (User has: {user_points:,} pts). Skipping.")
 
-    # If in-stock items exist, but none can be afforded with current points balance, do NOT alert!
     if not affordable_items:
-        logger.info(f"Cards found in stock, but none are affordable with current balance ({user_points:,} pts). Skipping notification.")
+        logger.info(f"Cards in stock, but none affordable with balance ({user_points:,} pts). Skipping notification.")
         return
 
-    # 4. Generate notification message with points & combos
+    # 4. Generate notification message
     logger.info(f"🎉 AFFORDABLE RESTOCK DETECTED! Items: {[i['name'] for i in affordable_items]}")
 
     items_block = []
@@ -436,8 +476,6 @@ def main():
         items_block.append(f"• *{item['name']}*{cost_str}\n  👉 {item['url']}")
 
     items_text = "\n".join(items_block)
-
-    # Calculate combination suggestions if multiple affordable
     combo_suggestions = calculate_redemption_plans(affordable_items, user_points)
     combo_text = ""
     if combo_suggestions:
@@ -448,7 +486,7 @@ def main():
 
     msg = (
         f"🚨 *MICROSOFT REWARDS RESTOCK ALERT!* 🚨\n\n"
-        f"💰 *Your Live Balance:* *{user_points:,} Points*\n"
+        f"💰 *Your Balance:* *{user_points:,} Points*\n"
         f"⚡ *In Stock & Redeemable by You:*\n\n"
         f"{items_text}"
         f"{combo_text}\n\n"
